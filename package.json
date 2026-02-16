@@ -1,0 +1,16 @@
+{
+  "name": "teams-recordings-api",
+  "version": "1.0.0",
+  "description": "API server for Teams recordings - connects to n8n",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^2.6.0",
+    "axios": "^1.6.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2"
+  }
+}

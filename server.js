@@ -32,16 +32,15 @@ let tokenCache = {};
 app.use(cors());
 app.use(express.json());
 
-/* ================= AUTH ================= */
-
+// AUTH ROUTES
 app.get('/auth/login', async (req, res) => {
     const authUrl = await msalClient.getAuthCodeUrl({
         scopes: [
             'User.Read',
-            'Files.Read.All',
+            'OnlineMeetings.Read',
+            'OnlineMeetingTranscript.Read.All',
             'Calendars.Read',
-            'OnlineMeetingTranscript.Read',
-            'OnlineMeetings.Read'
+            'Files.Read.All'
         ],
         redirectUri: config.redirectUri
     });
@@ -54,116 +53,84 @@ app.get('/auth/callback', async (req, res) => {
             code: req.query.code,
             scopes: [
                 'User.Read',
-                'Files.Read.All',
+                'OnlineMeetings.Read',
+                'OnlineMeetingTranscript.Read.All',
                 'Calendars.Read',
-                'OnlineMeetingTranscript.Read',
-                'OnlineMeetings.Read'
+                'Files.Read.All'
             ],
             redirectUri: config.redirectUri
         });
-
+        
         tokenCache = {
             accessToken: tokenResponse.accessToken,
             expiresOn: tokenResponse.expiresOn,
             account: tokenResponse.account
         };
 
-        res.send("<h1>Authentication Successful</h1>");
-    } catch (error) {
-        res.status(500).json({ error: error.message });
+        res.send("<h1>Authentication successful 🎉</h1>");
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 });
 
-async function callGraph(endpoint) {
+async function graphGetBeta(path) {
     if (!tokenCache.accessToken) throw new Error("Not authenticated");
-    const response = await axios.get(`https://graph.microsoft.com/v1.0${endpoint}`, {
-        headers: { Authorization: `Bearer ${tokenCache.accessToken}` }
+    const url = `https://graph.microsoft.com/beta${path}`;
+    const r = await axios.get(url, {
+        headers: {
+            Authorization: `Bearer ${tokenCache.accessToken}`
+        }
     });
-    return response.data;
+    return r.data;
 }
 
-/* ================= RECORDINGS ================= */
-
-app.get('/api/recordings', async (req, res) => {
-    try {
-        const data = await callGraph(
-            "/me/drive/root/search(q='.mp4')?$select=id,name,size,webUrl,lastModifiedDateTime,@microsoft.graph.downloadUrl&$top=50"
-        );
-
-        res.json({
-            success: true,
-            recordings: data.value || []
-        });
-
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-/* ================= REAL TRANSCRIPTS ================= */
-
+// REAL TRANSCRIPTS API
 app.get('/api/transcripts', async (req, res) => {
     try {
-        // 1️⃣ Get all user meetings
-        const meetings = await callGraph("/me/onlineMeetings?$top=50");
+        // 1️⃣ Get the current user’s online meetings
+        const meetings = await graphGetBeta('/me/onlineMeetings');
 
-        let allTranscripts = [];
+        let results = [];
 
+        // 2️⃣ Loop each meeting and fetch transcripts
         for (const meeting of meetings.value || []) {
             try {
-                const transcripts = await callGraph(
+                const transcripts = await graphGetBeta(
                     `/me/onlineMeetings/${meeting.id}/transcripts`
                 );
 
-                for (const transcript of transcripts.value || []) {
-                    allTranscripts.push({
+                for (const t of transcripts.value || []) {
+                    // 3️⃣ Fetch actual transcript text
+                    let textResponse = null;
+                    try {
+                        const textRes = await axios.get(t.contentUrl);
+                        textResponse = textRes.data;
+                    } catch (fetchErr) {
+                        textResponse = null;
+                    }
+
+                    results.push({
                         meetingId: meeting.id,
                         meetingSubject: meeting.subject,
-                        transcriptId: transcript.id,
-                        createdDateTime: transcript.createdDateTime,
-                        contentUrl: transcript.contentUrl
+                        transcriptId: t.id,
+                        created: t.createdDateTime,
+                        contentUrl: t.contentUrl,
+                        text: textResponse
                     });
                 }
-
-            } catch (innerError) {
-                // Skip meetings without transcripts
-            }
+            } catch {}
         }
 
         res.json({
             success: true,
-            count: allTranscripts.length,
-            transcripts: allTranscripts
+            total: results.length,
+            transcripts: results
         });
-
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+    } catch (err) {
+        res.status(500).json({ success:false, error: err.message });
     }
 });
-
-/* ================= DOWNLOAD TRANSCRIPT CONTENT ================= */
-
-app.get('/api/transcripts/:meetingId/:transcriptId', async (req, res) => {
-    try {
-        const { meetingId, transcriptId } = req.params;
-
-        const response = await axios.get(
-            `https://graph.microsoft.com/v1.0/me/onlineMeetings/${meetingId}/transcripts/${transcriptId}/content`,
-            {
-                headers: { Authorization: `Bearer ${tokenCache.accessToken}` }
-            }
-        );
-
-        res.setHeader("Content-Type", "text/vtt");
-        res.send(response.data);
-
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-/* ================= START SERVER ================= */
 
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Server listening on port ${PORT}`);
 });

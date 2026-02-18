@@ -5,7 +5,7 @@ const { ConfidentialClientApplication } = require('@azure/msal-node');
 const app = express();
 const PORT = process.env.PORT || 3002;
 
-// ================== MSAL CLIENT ==================
+// ================== MSAL ==================
 const msalClient = new ConfidentialClientApplication({
     auth: {
         clientId: process.env.AZURE_CLIENT_ID,
@@ -14,78 +14,75 @@ const msalClient = new ConfidentialClientApplication({
     }
 });
 
-// ================== GET APPLICATION TOKEN ==================
+// ================== GET APP TOKEN ==================
 async function getAppToken() {
     const result = await msalClient.acquireTokenByClientCredential({
         scopes: ["https://graph.microsoft.com/.default"]
     });
-
-    if (!result || !result.accessToken) {
-        throw new Error("Failed to acquire Graph access token");
-    }
-
     return result.accessToken;
 }
 
-// ================== HEALTH CHECK ==================
+// ================== HEALTH ==================
 app.get("/", (req, res) => {
     res.json({
-        name: "Teams Recording Fetch API",
         status: "running",
         endpoints: {
-            recordings: "/api/recordings?fromDate=YYYY-MM-DD"
+            recordings: "/api/recordings",
+            download: "/api/download/:itemId"
         }
     });
 });
 
-// ================== FETCH RECORDINGS ==================
+// ================== LIST RECORDINGS ==================
 app.get("/api/recordings", async (req, res) => {
     try {
         const token = await getAppToken();
-
         const userId = process.env.TEAMS_USER_ID;
-        if (!userId) {
-            return res.status(400).json({ error: "TEAMS_USER_ID env variable not set" });
-        }
 
-        // Optional filter by date
-        const fromDate = req.query.fromDate ? new Date(req.query.fromDate) : null;
-
-        const graphResponse = await axios.get(
-            `https://graph.microsoft.com/v1.0/users/${userId}/drive/root/search(q='.mp4')?$select=id,name,size,webUrl,@microsoft.graph.downloadUrl,lastModifiedDateTime&$top=100`,
+        const response = await axios.get(
+            `https://graph.microsoft.com/v1.0/users/${userId}/drive/root/search(q='.mp4')?$select=id,name,lastModifiedDateTime,webUrl`,
             {
-                headers: {
-                    Authorization: `Bearer ${token}`
-                }
+                headers: { Authorization: `Bearer ${token}` }
             }
         );
 
-        const files = graphResponse.data.value || [];
-
-        // Filter only Teams recordings
-        let recordings = files.filter(file =>
-            file.name.toLowerCase().includes("meeting") ||
-            file.name.toLowerCase().includes("recording")
-        );
-
-        // Optional date filter
-        if (fromDate) {
-            recordings = recordings.filter(file =>
-                new Date(file.lastModifiedDateTime) >= fromDate
-            );
-        }
+        const recordings = (response.data.value || []).map(file => ({
+            meetingName: file.name,
+            meetingDate: file.lastModifiedDateTime,
+            itemId: file.id,
+            stableDownloadUrl: `${req.protocol}://${req.get('host')}/api/download/${file.id}`,
+            webUrl: file.webUrl
+        }));
 
         res.json({
             total: recordings.length,
-            recordings: recordings.map(file => ({
-                id: file.id,
-                name: file.name,
-                sizeMB: (file.size / 1024 / 1024).toFixed(2),
-                lastModified: file.lastModifiedDateTime,
-                webUrl: file.webUrl,
-                downloadUrl: file["@microsoft.graph.downloadUrl"]
-            }))
+            recordings
         });
+
+    } catch (err) {
+        res.status(500).json({
+            error: err.response?.data || err.message
+        });
+    }
+});
+
+// ================== STABLE DOWNLOAD ENDPOINT ==================
+app.get("/api/download/:itemId", async (req, res) => {
+    try {
+        const token = await getAppToken();
+        const userId = process.env.TEAMS_USER_ID;
+        const itemId = req.params.itemId;
+
+        const fileResponse = await axios.get(
+            `https://graph.microsoft.com/v1.0/users/${userId}/drive/items/${itemId}/content`,
+            {
+                headers: { Authorization: `Bearer ${token}` },
+                responseType: 'stream'
+            }
+        );
+
+        res.setHeader('Content-Type', 'video/mp4');
+        fileResponse.data.pipe(res);
 
     } catch (err) {
         res.status(500).json({
@@ -98,10 +95,10 @@ app.get("/api/recordings", async (req, res) => {
 app.listen(PORT, () => {
     console.log(`
 =========================================
-Teams Recording API Running
+Teams Stable Recording Server Running
 =========================================
 GET /api/recordings
-Optional: ?fromDate=2026-01-01
+GET /api/download/:itemId
 =========================================
 `);
 });

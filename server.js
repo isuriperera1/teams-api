@@ -5,6 +5,7 @@ const { ConfidentialClientApplication } = require('@azure/msal-node');
 const app = express();
 const PORT = process.env.PORT || 3002;
 
+// ================== MSAL CLIENT ==================
 const msalClient = new ConfidentialClientApplication({
     auth: {
         clientId: process.env.AZURE_CLIENT_ID,
@@ -13,67 +14,77 @@ const msalClient = new ConfidentialClientApplication({
     }
 });
 
-// 🔐 Get application token
+// ================== GET APPLICATION TOKEN ==================
 async function getAppToken() {
     const result = await msalClient.acquireTokenByClientCredential({
         scopes: ["https://graph.microsoft.com/.default"]
     });
+
+    if (!result || !result.accessToken) {
+        throw new Error("Failed to acquire Graph access token");
+    }
+
     return result.accessToken;
 }
 
-// 🔥 Get ALL recap transcripts across tenant
-app.get('/api/transcripts', async (req, res) => {
+// ================== HEALTH CHECK ==================
+app.get("/", (req, res) => {
+    res.json({
+        name: "Teams Recording Fetch API",
+        status: "running",
+        endpoints: {
+            recordings: "/api/recordings?fromDate=YYYY-MM-DD"
+        }
+    });
+});
+
+// ================== FETCH RECORDINGS ==================
+app.get("/api/recordings", async (req, res) => {
     try {
         const token = await getAppToken();
 
-        // 1️⃣ Get call records
-        const callRecordsResponse = await axios.get(
-            "https://graph.microsoft.com/beta/communications/callRecords",
+        const userId = process.env.TEAMS_USER_ID;
+        if (!userId) {
+            return res.status(400).json({ error: "TEAMS_USER_ID env variable not set" });
+        }
+
+        // Optional filter by date
+        const fromDate = req.query.fromDate ? new Date(req.query.fromDate) : null;
+
+        const graphResponse = await axios.get(
+            `https://graph.microsoft.com/v1.0/users/${userId}/drive/root/search(q='.mp4')?$select=id,name,size,webUrl,@microsoft.graph.downloadUrl,lastModifiedDateTime&$top=100`,
             {
-                headers: { Authorization: `Bearer ${token}` }
+                headers: {
+                    Authorization: `Bearer ${token}`
+                }
             }
         );
 
-        const callRecords = callRecordsResponse.data.value || [];
-        let allTranscripts = [];
+        const files = graphResponse.data.value || [];
 
-        // 2️⃣ For each call record fetch transcripts
-        for (const record of callRecords) {
-            try {
-                const transcriptResponse = await axios.get(
-                    `https://graph.microsoft.com/beta/communications/callRecords/${record.id}/transcripts`,
-                    {
-                        headers: { Authorization: `Bearer ${token}` }
-                    }
-                );
+        // Filter only Teams recordings
+        let recordings = files.filter(file =>
+            file.name.toLowerCase().includes("meeting") ||
+            file.name.toLowerCase().includes("recording")
+        );
 
-                for (const transcript of transcriptResponse.data.value || []) {
-
-                    // 3️⃣ Fetch transcript content
-                    let content = null;
-                    try {
-                        const contentResponse = await axios.get(
-                            `https://graph.microsoft.com/beta/communications/callRecords/${record.id}/transcripts/${transcript.id}/content`,
-                            {
-                                headers: { Authorization: `Bearer ${token}` }
-                            }
-                        );
-                        content = contentResponse.data;
-                    } catch {}
-
-                    allTranscripts.push({
-                        callRecordId: record.id,
-                        transcriptId: transcript.id,
-                        createdDateTime: transcript.createdDateTime,
-                        content: content
-                    });
-                }
-            } catch {}
+        // Optional date filter
+        if (fromDate) {
+            recordings = recordings.filter(file =>
+                new Date(file.lastModifiedDateTime) >= fromDate
+            );
         }
 
         res.json({
-            total: allTranscripts.length,
-            transcripts: allTranscripts
+            total: recordings.length,
+            recordings: recordings.map(file => ({
+                id: file.id,
+                name: file.name,
+                sizeMB: (file.size / 1024 / 1024).toFixed(2),
+                lastModified: file.lastModifiedDateTime,
+                webUrl: file.webUrl,
+                downloadUrl: file["@microsoft.graph.downloadUrl"]
+            }))
         });
 
     } catch (err) {
@@ -83,6 +94,14 @@ app.get('/api/transcripts', async (req, res) => {
     }
 });
 
+// ================== START SERVER ==================
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`
+=========================================
+Teams Recording API Running
+=========================================
+GET /api/recordings
+Optional: ?fromDate=2026-01-01
+=========================================
+`);
 });

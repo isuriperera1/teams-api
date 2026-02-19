@@ -3,6 +3,10 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const { ConfidentialClientApplication } = require('@azure/msal-node');
+const { google } = require('googleapis');
+const fs = require('fs');
+const path = require('path');
+
 const app = express();
 const PORT = process.env.PORT || 3002;
 
@@ -18,6 +22,14 @@ const msalClient = new ConfidentialClientApplication({
     }
 });
 
+// ================== GOOGLE DRIVE SETUP ==================
+const auth = new google.auth.GoogleAuth({
+    keyFile: path.join(__dirname, 'credentials.json'),  // ← FIXED: Absolute path
+    scopes: ['https://www.googleapis.com/auth/drive.file']
+});
+
+const drive = google.drive({ version: 'v3', auth });
+
 // ================== GET APPLICATION TOKEN ==================
 async function getAppToken() {
     const result = await msalClient.acquireTokenByClientCredential({
@@ -29,91 +41,107 @@ async function getAppToken() {
     return result.accessToken;
 }
 
+// ================== UPLOAD TO GOOGLE DRIVE ==================
+async function uploadToDrive(fileStream, fileName, folderId) {
+    const fileMetadata = {
+        name: fileName,
+        parents: [folderId]
+    };
+
+    const media = {
+        mimeType: 'video/mp4',
+        body: fileStream
+    };
+
+    const response = await drive.files.create({
+        requestBody: fileMetadata,
+        media: media,
+        fields: 'id, name, webViewLink'
+    });
+
+    return response.data;
+}
+
 // ================== HEALTH CHECK ==================
 app.get("/", (req, res) => {
     res.json({
         status: "running",
-        server: "Teams Recording Server",
+        server: "Teams Recording Server with Google Drive",
         endpoints: {
-            recordings: "/api/recordings",
-            download: "/api/download/:itemId",
-            n8n: "/api/n8n/recordings"
+            uploadAll: "/api/upload-all-to-drive"
         }
     });
 });
 
-// ================== LIST ALL MP4 RECORDINGS (FOR FRONTEND) ==================
-app.get("/api/recordings", async (req, res) => {
+// ================== 🔥 UPLOAD ALL RECORDINGS TO GOOGLE DRIVE ==================
+app.get("/api/upload-all-to-drive", async (req, res) => {
     try {
         const token = await getAppToken();
         const userId = process.env.TEAMS_USER_ID;
+        const folderId = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
-        if (!userId) {
+        if (!userId || !folderId) {
             return res.status(500).json({
-                error: "TEAMS_USER_ID environment variable missing"
+                error: "Missing TEAMS_USER_ID or GOOGLE_DRIVE_FOLDER_ID"
             });
         }
 
-        const response = await axios.get(
-            `https://graph.microsoft.com/v1.0/users/${userId}/drive/root/search(q='.mp4')?$select=id,name,lastModifiedDateTime,webUrl,size`,
-            {
-                headers: { Authorization: `Bearer ${token}` }
-            }
-        );
-
-        const recordings = (response.data.value || []).map(file => ({
-            meetingName: file.name,
-            meetingDate: file.lastModifiedDateTime,
-            sizeBytes: file.size,
-            sizeMB: file.size ? (file.size / 1024 / 1024).toFixed(2) + " MB" : "Unknown",
-            itemId: file.id,
-            webUrl: file.webUrl,
-            stableDownloadUrl: `${req.protocol}://${req.get('host')}/api/download/${file.id}`
-        }));
-
-        res.json({
-            total: recordings.length,
-            recordings
-        });
-    } catch (err) {
-        res.status(500).json({
-            error: err.response?.data || err.message
-        });
-    }
-});
-
-// ================== 🔥 N8N ENDPOINT - GET RECORDING URLS ==================
-app.get("/api/n8n/recordings", async (req, res) => {
-    try {
-        const token = await getAppToken();
-        const userId = process.env.TEAMS_USER_ID;
-
-        if (!userId) {
-            return res.status(500).json({
-                error: "TEAMS_USER_ID environment variable missing"
-            });
-        }
-
+        // Get all MP4 recordings
         const response = await axios.get(
             `https://graph.microsoft.com/v1.0/users/${userId}/drive/root/search(q='.mp4')?$select=id,name,lastModifiedDateTime,size`,
-            {
-                headers: { Authorization: `Bearer ${token}` }
-            }
+            { headers: { Authorization: `Bearer ${token}` } }
         );
 
-        // Clean format for n8n
-        const recordings = (response.data.value || []).map(file => ({
-            fileName: file.name,
-            fileSize: file.size ? (file.size / 1024 / 1024).toFixed(2) + " MB" : "Unknown",
-            recordingDate: file.lastModifiedDateTime,
-            itemId: file.id,
-            downloadUrl: `${req.protocol}://${req.get('host')}/api/download/${file.id}`
-        }));
+        const recordings = response.data.value || [];
+        const results = [];
+
+        console.log(`Found ${recordings.length} recordings. Starting upload...`);
+
+        // Upload each recording
+        for (const file of recordings) {
+            try {
+                console.log(`Uploading: ${file.name}...`);
+
+                // Download from OneDrive as stream
+                const fileStream = await axios.get(
+                    `https://graph.microsoft.com/v1.0/users/${userId}/drive/items/${file.id}/content`,
+                    {
+                        headers: { Authorization: `Bearer ${token}` },
+                        responseType: 'stream'
+                    }
+                );
+
+                // Upload to Google Drive
+                const driveFile = await uploadToDrive(
+                    fileStream.data,
+                    file.name,
+                    folderId
+                );
+
+                results.push({
+                    fileName: file.name,
+                    status: 'uploaded',
+                    googleDriveLink: driveFile.webViewLink,
+                    fileId: driveFile.id
+                });
+
+                console.log(`✅ Uploaded: ${file.name}`);
+            } catch (err) {
+                results.push({
+                    fileName: file.name,
+                    status: 'failed',
+                    error: err.message
+                });
+                console.error(`❌ Failed: ${file.name} - ${err.message}`);
+            }
+        }
 
         res.json({
             success: true,
             total: recordings.length,
-            recordings: recordings
+            uploaded: results.filter(r => r.status === 'uploaded').length,
+            failed: results.filter(r => r.status === 'failed').length,
+            results: results
         });
     } catch (err) {
         res.status(500).json({
@@ -123,42 +151,15 @@ app.get("/api/n8n/recordings", async (req, res) => {
     }
 });
 
-// ================== STREAM/DOWNLOAD RECORDING ==================
-app.get("/api/download/:itemId", async (req, res) => {
-    try {
-        const token = await getAppToken();
-        const userId = process.env.TEAMS_USER_ID;
-        const itemId = req.params.itemId;
-
-        const fileResponse = await axios.get(
-            `https://graph.microsoft.com/v1.0/users/${userId}/drive/items/${itemId}/content`,
-            {
-                headers: { Authorization: `Bearer ${token}` },
-                responseType: "stream"
-            }
-        );
-
-        res.setHeader("Content-Type", "video/mp4");
-        res.setHeader("Content-Disposition", "attachment"); // Forces download
-        fileResponse.data.pipe(res);
-    } catch (err) {
-        res.status(500).json({
-            error: err.response?.data || err.message
-        });
-    }
-});
-
 // ================== START SERVER ==================
 app.listen(PORT, () => {
     console.log(`
 ==================================================
-  Teams Recording Server
+  Teams Recording → Google Drive Server
   Port: ${PORT}
 ==================================================
-  Frontend:   /
-  Recordings: /api/recordings
-  Download:   /api/download/:itemId
-  🔥 N8N:     /api/n8n/recordings
+  Test: http://localhost:${PORT}
+  Upload All: http://localhost:${PORT}/api/upload-all-to-drive
 ==================================================
 `);
 });

@@ -2,7 +2,6 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const { ConfidentialClientApplication } = require('@azure/msal-node');
-
 const app = express();
 const PORT = process.env.PORT || 3002;
 
@@ -23,11 +22,9 @@ async function getAppToken() {
     const result = await msalClient.acquireTokenByClientCredential({
         scopes: ["https://graph.microsoft.com/.default"]
     });
-
     if (!result || !result.accessToken) {
         throw new Error("Failed to acquire Graph token");
     }
-
     return result.accessToken;
 }
 
@@ -35,15 +32,16 @@ async function getAppToken() {
 app.get("/", (req, res) => {
     res.json({
         status: "running",
-        server: "Teams Stable Recording Server",
+        server: "Teams Recording Server",
         endpoints: {
-            listRecordings: "/api/recordings",
-            downloadRecording: "/api/download/:itemId"
+            recordings: "/api/recordings",
+            download: "/api/download/:itemId",
+            n8n: "/api/n8n/recordings"
         }
     });
 });
 
-// ================== LIST ALL MP4 RECORDINGS ==================
+// ================== LIST ALL MP4 RECORDINGS (FOR FRONTEND) ==================
 app.get("/api/recordings", async (req, res) => {
     try {
         const token = await getAppToken();
@@ -68,9 +66,7 @@ app.get("/api/recordings", async (req, res) => {
             sizeBytes: file.size,
             sizeMB: file.size ? (file.size / 1024 / 1024).toFixed(2) + " MB" : "Unknown",
             itemId: file.id,
-            graphWebUrl: file.webUrl,
-
-            // 🔥 THIS is your stable hardcoded backend download URL
+            webUrl: file.webUrl,
             stableDownloadUrl: `${req.protocol}://${req.get('host')}/api/download/${file.id}`
         }));
 
@@ -78,7 +74,6 @@ app.get("/api/recordings", async (req, res) => {
             total: recordings.length,
             recordings
         });
-
     } catch (err) {
         res.status(500).json({
             error: err.response?.data || err.message
@@ -86,7 +81,48 @@ app.get("/api/recordings", async (req, res) => {
     }
 });
 
-// ================== STREAM RECORDING (STABLE DOWNLOAD LINK) ==================
+// ================== 🔥 N8N ENDPOINT - GET RECORDING URLS ==================
+app.get("/api/n8n/recordings", async (req, res) => {
+    try {
+        const token = await getAppToken();
+        const userId = process.env.TEAMS_USER_ID;
+
+        if (!userId) {
+            return res.status(500).json({
+                error: "TEAMS_USER_ID environment variable missing"
+            });
+        }
+
+        const response = await axios.get(
+            `https://graph.microsoft.com/v1.0/users/${userId}/drive/root/search(q='.mp4')?$select=id,name,lastModifiedDateTime,size`,
+            {
+                headers: { Authorization: `Bearer ${token}` }
+            }
+        );
+
+        // Clean format for n8n
+        const recordings = (response.data.value || []).map(file => ({
+            fileName: file.name,
+            fileSize: file.size ? (file.size / 1024 / 1024).toFixed(2) + " MB" : "Unknown",
+            recordingDate: file.lastModifiedDateTime,
+            itemId: file.id,
+            downloadUrl: `${req.protocol}://${req.get('host')}/api/download/${file.id}`
+        }));
+
+        res.json({
+            success: true,
+            total: recordings.length,
+            recordings: recordings
+        });
+    } catch (err) {
+        res.status(500).json({
+            success: false,
+            error: err.response?.data || err.message
+        });
+    }
+});
+
+// ================== STREAM/DOWNLOAD RECORDING ==================
 app.get("/api/download/:itemId", async (req, res) => {
     try {
         const token = await getAppToken();
@@ -102,10 +138,8 @@ app.get("/api/download/:itemId", async (req, res) => {
         );
 
         res.setHeader("Content-Type", "video/mp4");
-        res.setHeader("Content-Disposition", "inline");
-
+        res.setHeader("Content-Disposition", "attachment"); // Forces download
         fileResponse.data.pipe(res);
-
     } catch (err) {
         res.status(500).json({
             error: err.response?.data || err.message
@@ -117,10 +151,13 @@ app.get("/api/download/:itemId", async (req, res) => {
 app.listen(PORT, () => {
     console.log(`
 ==================================================
-Teams Stable Recording Server Running
+  Teams Recording Server
+  Port: ${PORT}
 ==================================================
-GET  /api/recordings
-GET  /api/download/:itemId
+  Frontend:   /
+  Recordings: /api/recordings
+  Download:   /api/download/:itemId
+  🔥 N8N:     /api/n8n/recordings
 ==================================================
 `);
 });
